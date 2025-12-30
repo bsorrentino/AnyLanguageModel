@@ -83,19 +83,8 @@ import Foundation
             // Map AnyLanguageModel GenerationOptions to MLX GenerateParameters
             let generateParameters = toGenerateParameters(options)
 
-            // Build chat history starting with system message if instructions are present
-            var chat: [MLXLMCommon.Chat.Message] = []
-
-            // Add system message if instructions are present
-            if let instructionSegments = extractInstructionSegments(from: session) {
-                let systemMessage = convertSegmentsToMLXSystemMessage(instructionSegments)
-                chat.append(systemMessage)
-            }
-
-            // Add user prompt
-            let userSegments = extractPromptSegments(from: session, fallbackText: prompt.description)
-            let userMessage = convertSegmentsToMLXMessage(userSegments)
-            chat.append(userMessage)
+            // Build chat history from full transcript
+            var chat = convertTranscriptToMLXChat(session: session, fallbackPrompt: prompt.description)
 
             var allTextChunks: [String] = []
             var allEntries: [Transcript.Entry] = []
@@ -178,17 +167,68 @@ import Foundation
             includeSchemaInPrompt: Bool,
             options: GenerationOptions
         ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
-            // For now, only String is supported
             guard type == String.self else {
                 fatalError("MLXLanguageModel only supports generating String content")
             }
 
-            // Streaming API in AnyLanguageModel currently yields once; return an empty snapshot
-            let empty = ""
-            return LanguageModelSession.ResponseStream(
-                content: empty as! Content,
-                rawContent: GeneratedContent(empty)
-            )
+            let modelId = self.modelId
+            let hub = self.hub
+            let directory = self.directory
+
+            let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
+                let task = Task { @Sendable in
+                    do {
+                        let context: ModelContext
+                        if let directory {
+                            context = try await loadModel(directory: directory)
+                        } else if let hub {
+                            context = try await loadModel(hub: hub, id: modelId)
+                        } else {
+                            context = try await loadModel(id: modelId)
+                        }
+
+                        let generateParameters = toGenerateParameters(options)
+
+                        // Build chat history from full transcript
+                        let chat = convertTranscriptToMLXChat(session: session, fallbackPrompt: prompt.description)
+
+                        let userInput = MLXLMCommon.UserInput(
+                            chat: chat,
+                            processing: .init(resize: .init(width: 512, height: 512)),
+                            tools: nil
+                        )
+                        let lmInput = try await context.processor.prepare(input: userInput)
+
+                        let mlxStream = try MLXLMCommon.generate(
+                            input: lmInput,
+                            parameters: generateParameters,
+                            context: context
+                        )
+
+                        var accumulatedText = ""
+                        for await item in mlxStream {
+                            if Task.isCancelled { break }
+
+                            switch item {
+                            case .chunk(let text):
+                                accumulatedText += text
+                                let raw = GeneratedContent(accumulatedText)
+                                let content: Content.PartiallyGenerated = (accumulatedText as! Content).asPartiallyGenerated()
+                                continuation.yield(.init(content: content, rawContent: raw))
+                            case .info, .toolCall:
+                                break
+                            }
+                        }
+
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { _ in task.cancel() }
+            }
+
+            return LanguageModelSession.ResponseStream(stream: stream)
         }
     }
 
@@ -208,43 +248,80 @@ import Foundation
         )
     }
 
-    // MARK: - Segment Extraction
+    // MARK: - Transcript Conversion
 
-    private func extractPromptSegments(from session: LanguageModelSession, fallbackText: String) -> [Transcript.Segment]
-    {
-        // Prefer the most recent Transcript.Prompt entry if present
-        for entry in session.transcript.reversed() {
-            if case .prompt(let p) = entry {
-                return p.segments
-            }
+    private func convertTranscriptToMLXChat(
+        session: LanguageModelSession,
+        fallbackPrompt: String
+    ) -> [MLXLMCommon.Chat.Message] {
+        var chat: [MLXLMCommon.Chat.Message] = []
+
+        // Check if instructions are already in transcript
+        let hasInstructionsInTranscript = session.transcript.contains {
+            if case .instructions = $0 { return true }
+            return false
         }
-        return [.text(.init(content: fallbackText))]
-    }
 
-    private func extractInstructionSegments(from session: LanguageModelSession) -> [Transcript.Segment]? {
-        // Prefer the first Transcript.Instructions entry if present
+        // Add instructions from session if present and not in transcript
+        if !hasInstructionsInTranscript,
+            let instructions = session.instructions?.description,
+            !instructions.isEmpty
+        {
+            chat.append(.init(role: .system, content: instructions))
+        }
+
+        // Convert each transcript entry
         for entry in session.transcript {
-            if case .instructions(let i) = entry {
-                return i.segments
+            switch entry {
+            case .instructions(let instr):
+                chat.append(makeMLXChatMessage(from: instr.segments, role: .system))
+
+            case .prompt(let prompt):
+                chat.append(makeMLXChatMessage(from: prompt.segments, role: .user))
+
+            case .response(let response):
+                let content = response.segments.map { extractText(from: $0) }.joined(separator: "\n")
+                chat.append(.assistant(content))
+
+            case .toolCalls:
+                // Tool calls are handled inline during generation loop
+                break
+
+            case .toolOutput(let toolOutput):
+                let content = toolOutput.segments.map { extractText(from: $0) }.joined(separator: "\n")
+                chat.append(.tool(content))
             }
         }
-        // Fallback to session.instructions
-        if let instructions = session.instructions?.description, !instructions.isEmpty {
-            return [.text(.init(content: instructions))]
+
+        // If no user message in transcript, add fallback prompt
+        let hasUserMessage = chat.contains { $0.role == .user }
+        if !hasUserMessage {
+            chat.append(.init(role: .user, content: fallbackPrompt))
         }
-        return nil
+
+        return chat
     }
 
-    private func convertSegmentsToMLXMessage(_ segments: [Transcript.Segment]) -> MLXLMCommon.Chat.Message {
+    private func extractText(from segment: Transcript.Segment) -> String {
+        switch segment {
+        case .text(let text):
+            return text.content
+        case .structure(let structured):
+            return structured.content.jsonString
+        case .image:
+            return ""
+        }
+    }
+
+    private func makeMLXChatMessage(
+        from segments: [Transcript.Segment],
+        role: MLXLMCommon.Chat.Message.Role
+    ) -> MLXLMCommon.Chat.Message {
         var textParts: [String] = []
         var images: [MLXLMCommon.UserInput.Image] = []
 
         for segment in segments {
             switch segment {
-            case .text(let text):
-                textParts.append(text.content)
-            case .structure(let structured):
-                textParts.append(structured.content.jsonString)
             case .image(let imageSegment):
                 switch imageSegment.source {
                 case .url(let url):
@@ -265,48 +342,16 @@ import Foundation
                         }
                     #endif
                 }
-            }
-        }
-
-        let content = textParts.joined(separator: "\n")
-        return MLXLMCommon.Chat.Message(role: .user, content: content, images: images)
-    }
-
-    private func convertSegmentsToMLXSystemMessage(_ segments: [Transcript.Segment]) -> MLXLMCommon.Chat.Message {
-        var textParts: [String] = []
-        var images: [MLXLMCommon.UserInput.Image] = []
-
-        for segment in segments {
-            switch segment {
-            case .text(let text):
-                textParts.append(text.content)
-            case .structure(let structured):
-                textParts.append(structured.content.jsonString)
-            case .image(let imageSegment):
-                switch imageSegment.source {
-                case .url(let url):
-                    images.append(.url(url))
-                case .data(let data, _):
-                    #if canImport(UIKit)
-                        if let uiImage = UIKit.UIImage(data: data),
-                            let ciImage = CIImage(image: uiImage)
-                        {
-                            images.append(.ciImage(ciImage))
-                        }
-                    #elseif canImport(AppKit)
-                        if let nsImage = AppKit.NSImage(data: data),
-                            let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
-                        {
-                            let ciImage = CIImage(cgImage: cgImage)
-                            images.append(.ciImage(ciImage))
-                        }
-                    #endif
+            default:
+                let text = extractText(from: segment)
+                if !text.isEmpty {
+                    textParts.append(text)
                 }
             }
         }
 
         let content = textParts.joined(separator: "\n")
-        return MLXLMCommon.Chat.Message(role: .system, content: content, images: images)
+        return MLXLMCommon.Chat.Message(role: role, content: content, images: images)
     }
 
     // MARK: - Tool Conversion
