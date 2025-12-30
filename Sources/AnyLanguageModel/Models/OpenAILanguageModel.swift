@@ -470,13 +470,13 @@ public struct OpenAILanguageModel: LanguageModel {
         }
     }
 
-    private func respondWithChatCompletions<Content>(
-        messages: [OpenAIMessage],
-        tools: [OpenAITool]?,
-        generating type: Content.Type,
-        options: GenerationOptions,
-        session: LanguageModelSession
-    ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+        private func respondWithChatCompletions<Content>(
+            messages: [OpenAIMessage],
+            tools: [OpenAITool]?,
+            generating type: Content.Type,
+            options: GenerationOptions,
+            session: LanguageModelSession
+        ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
         let params = try ChatCompletions.createRequestBody(
             model: model,
             messages: messages,
