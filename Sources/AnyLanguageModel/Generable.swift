@@ -42,6 +42,15 @@ public enum GeneratedContentConversionError: Error {
 // MARK: - Macros
 
 /// Conforms a type to ``Generable`` protocol.
+///
+/// This macro synthesizes a memberwise initializer
+/// and an `init(_ generatedContent: GeneratedContent)` initializer
+/// for the annotated type.
+///
+/// - Note: The synthesized memberwise initializer isn't visible inside other macro bodies,
+///         such as `#Playground`.
+///         As a workaround, use the `init(_ generatedContent:)` initializer
+///         or define a factory method on the type.
 @attached(extension, conformances: Generable, names: named(init(_:)), named(generatedContent))
 @attached(member, names: arbitrary)
 public macro Generable(description: String? = nil) =
@@ -69,7 +78,13 @@ public macro Guide<RegexOutput>(
 extension Generable {
     /// The partially generated type of this struct.
     public func asPartiallyGenerated() -> Self.PartiallyGenerated {
-        self as! Self.PartiallyGenerated
+        if let partial = self as? Self.PartiallyGenerated {
+            return partial
+        }
+        if let partial: Self.PartiallyGenerated = try? .init(self.generatedContent) {
+            return partial
+        }
+        fatalError("Unable to convert \(Self.self) to partially generated form")
     }
 }
 

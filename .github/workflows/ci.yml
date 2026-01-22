@@ -41,11 +41,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-swift-${{ matrix.swift }}-spm-
 
+      - name: Lint
+        run: swift format lint --strict --recursive .
+
       - name: Build
-        run: swift build -v
+        run: swift build --build-tests --traits MLX,Llama,CoreML
 
       - name: Test
-        run: swift test -v
+        run: swift test --skip-build
 
   test-linux:
     name: Swift ${{ matrix.swift-version }} on Linux
@@ -65,8 +68,11 @@ jobs:
         with:
           toolchain: ${{ matrix.swift-version }}
 
+      - name: Lint
+        run: swift format lint --strict --recursive .
+
       - name: Build
-        run: swift build -v
+        run: swift build
 
       - name: Test
-        run: swift test -v
+        run: swift test
