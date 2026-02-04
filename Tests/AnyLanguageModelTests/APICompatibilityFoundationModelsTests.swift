@@ -3,8 +3,18 @@ import Testing
 #if canImport(FoundationModels)
     import FoundationModels
 
-    @available(macOS 26.0, *)
-    @Test("FoundationModels Drop-In Compatibility", .enabled(if: SystemLanguageModel.default.isAvailable))
+    private let isFoundationModelsSystemLanguageModelAvailable: Bool = {
+        if #available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, visionOS 26.0, *) {
+            return SystemLanguageModel.default.isAvailable
+        }
+        return false
+    }()
+
+    @available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, visionOS 26.0, *)
+    @Test(
+        "FoundationModels Drop-In Compatibility",
+        .enabled(if: isFoundationModelsSystemLanguageModelAvailable)
+    )
     func foundationModelsCompatibility() async throws {
         let model = SystemLanguageModel.default
         let session = LanguageModelSession(
